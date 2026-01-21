@@ -1,8 +1,4 @@
-"""
-Fast CPU-friendly AI Service for Bug Tracker
-Uses lightweight models: sentence-transformers + scikit-learn
-No GPU required - runs fast on laptops!
-"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
