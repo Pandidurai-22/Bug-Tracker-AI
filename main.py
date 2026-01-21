@@ -1,15 +1,22 @@
-# main.py
+"""
+Fast CPU-friendly AI Service for Bug Tracker
+Uses lightweight models: sentence-transformers + scikit-learn
+No GPU required - runs fast on laptops!
+"""
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from sentence_transformers import SentenceTransformer
-import torch
-import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Optional
-import re
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+import pickle
+import os
+from typing import List, Optional
+import time
 
-app = FastAPI(title="Bug Tracker AI Service", version="1.0.0")
+app = FastAPI(title="Bug Tracker AI Service", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,286 +26,368 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Hugging Face Models
-T5_MODEL_NAME = "google/flan-t5-small"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+# Global models (loaded once at startup)
+embedding_model = None
+severity_classifier = None
+tag_classifier = None
+vectorizer = None
 
-# Load models
-print("Loading Hugging Face models...")
-t5_tokenizer = AutoTokenizer.from_pretrained(T5_MODEL_NAME)
-t5_model = AutoModelForSeq2SeqLM.from_pretrained(T5_MODEL_NAME)
-t5_model.eval()
+# Model configuration
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # Fast, CPU-friendly
+SEVERITY_LABELS = ["Low", "Medium", "High", "Critical"]
+TAG_CATEGORIES = ["UI", "Backend", "Database", "Authentication", "Performance", "Security", "API", "Other"]
 
-# Load embedding model for similarity search (using SentenceTransformer)
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-print("Models loaded successfully!")
-
+# Request/Response models
 class BugRequest(BaseModel):
     text: str
-    task: str = "summarize"
+    task: str = "predict_severity"
 
 class ComprehensiveAnalysisRequest(BaseModel):
     text: str
 
-class EmbeddingRequest(BaseModel):
+class SimilarBugRequest(BaseModel):
     text: str
+    limit: int = 5
 
-def generate_embedding(text: str) -> List[float]:
-    """Generate embedding vector for text similarity search"""
-    # SentenceTransformer handles tokenization and encoding automatically
-    embedding = embedding_model.encode(text, convert_to_numpy=True)
-    return embedding.tolist()
+class SimilarBugResponse(BaseModel):
+    bug_id: int
+    similarity_score: float
+    title: str
 
-def extract_entities(text: str) -> Dict[str, List[str]]:
-    """Extract entities from bug description using pattern matching"""
-    entities = {
-        "components": [],
-        "error_types": [],
-        "file_paths": [],
-        "urls": []
-    }
-    
-    # Extract file paths
-    file_pattern = r'[\w/\\]+\.(java|js|py|ts|tsx|jsx|html|css|json|xml|yml|yaml|properties|sql|md|txt)'
-    file_paths = re.findall(file_pattern, text, re.IGNORECASE)
-    entities["file_paths"] = list(set(file_paths))
-    
-    # Extract URLs
-    url_pattern = r'https?://[^\s]+'
-    urls = re.findall(url_pattern, text)
-    entities["urls"] = list(set(urls))
-    
-    # Extract common error types
-    error_keywords = {
-        "NullPointerException": ["null pointer", "nullpointer", "npe"],
-        "TimeoutException": ["timeout", "timed out"],
-        "SQLException": ["sql error", "database error", "query failed"],
-        "IOException": ["io error", "file not found", "cannot read"],
-        "AuthenticationError": ["authentication failed", "login error", "unauthorized"],
-        "ValidationError": ["validation failed", "invalid input", "bad request"]
-    }
-    
-    text_lower = text.lower()
-    for error_type, keywords in error_keywords.items():
-        if any(keyword in text_lower for keyword in keywords):
-            entities["error_types"].append(error_type)
-    
-    # Extract component names (simple heuristic)
-    component_keywords = ["api", "database", "frontend", "backend", "ui", "auth", "payment", "email"]
-    for component in component_keywords:
-        if component.lower() in text_lower:
-            entities["components"].append(component.capitalize())
-    
-    return entities
+class ComprehensiveAnalysisResponse(BaseModel):
+    severity: str
+    priority: str
+    tags: List[str]
+    summary: str
+    embedding: List[float]
+
+class EmbeddingResponse(BaseModel):
+    embedding: List[float]
+
+class SimilarBugsResponse(BaseModel):
+    similar_bugs: List[SimilarBugResponse]
 
 @app.on_event("startup")
 async def startup_event():
-    """Warm up models on startup"""
-    print("Warming up models...")
-    with torch.no_grad():
-        # Warm up T5 model
-        inputs = t5_tokenizer(
-            "summarize the following bug report:\nwarm up",
-            return_tensors="pt"
-        )
-        t5_model.generate(**inputs, max_new_tokens=10)
-        
-        # Warm up embedding model
-        embedding_model.encode("warm up")
-    print("Models warmed up!")
+    """Load models on startup - happens once"""
+    global embedding_model, severity_classifier, tag_classifier, vectorizer
+    
+    print("🚀 Loading AI models (CPU-friendly)...")
+    start_time = time.time()
+    
+    # Load embedding model (for duplicate detection)
+    try:
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        print(f"✅ Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+    except Exception as e:
+        print(f"❌ Failed to load embedding model: {e}")
+        embedding_model = None
+    
+    # Initialize TF-IDF vectorizer
+    vectorizer = TfidfVectorizer(max_features=1000, stop_words='english', ngram_range=(1, 2))
+    
+    # Train lightweight classifiers (using rule-based + keyword features)
+    # In production, you'd train these on real bug data
+    train_severity_classifier()
+    train_tag_classifier()
+    
+    elapsed = time.time() - start_time
+    print(f"✅ All models loaded in {elapsed:.2f}s - Ready for inference!")
+    print("💡 Models optimized for CPU - no GPU required!")
+
+def train_severity_classifier():
+    """Train severity classifier using keyword-based features"""
+    global severity_classifier, vectorizer
+    
+    # Training data (keyword-based - you can expand this)
+    training_texts = [
+        # Critical
+        "application crash data loss system down",
+        "security breach unauthorized access",
+        "database corruption all data lost",
+        "complete system failure",
+        # High
+        "login not working authentication failed",
+        "payment processing error",
+        "api endpoint returning 500 error",
+        "major feature broken",
+        # Medium
+        "button not clicking properly",
+        "slow response time",
+        "minor display issue",
+        "form validation error",
+        # Low
+        "typo in error message",
+        "color scheme suggestion",
+        "minor UI improvement",
+        "cosmetic issue"
+    ]
+    
+    training_labels = [
+        "Critical", "Critical", "Critical", "Critical",
+        "High", "High", "High", "High",
+        "Medium", "Medium", "Medium", "Medium",
+        "Low", "Low", "Low", "Low"
+    ]
+    
+    # Expand training data
+    expanded_texts = training_texts * 3
+    expanded_labels = training_labels * 3
+    
+    try:
+        X = vectorizer.fit_transform(expanded_texts)
+        severity_classifier = LogisticRegression(max_iter=1000, random_state=42)
+        severity_classifier.fit(X, expanded_labels)
+        print("✅ Severity classifier trained")
+    except Exception as e:
+        print(f"⚠️ Severity classifier training failed: {e}")
+        severity_classifier = None
+
+def train_tag_classifier():
+    """Train tag classifier"""
+    global tag_classifier
+    
+    training_texts = [
+        # UI
+        "button color issue", "layout problem", "responsive design",
+        "frontend component", "user interface", "css styling",
+        # Backend
+        "server error", "api endpoint", "business logic",
+        "backend service", "server-side", "application logic",
+        # Database
+        "database query", "sql error", "data retrieval",
+        "database connection", "data persistence", "query optimization",
+        # Authentication
+        "login failed", "authentication error", "session expired",
+        "password reset", "user credentials", "access control",
+        # Performance
+        "slow loading", "response time", "performance issue",
+        "optimization needed", "bottleneck", "timeout error",
+        # Security
+        "security vulnerability", "xss attack", "sql injection",
+        "unauthorized access", "data breach", "encryption",
+        # API
+        "rest api", "endpoint error", "http request",
+        "api integration", "webhook", "service call",
+        # Other
+        "general issue", "miscellaneous", "other problem"
+    ]
+    
+    training_labels = [
+        "UI", "UI", "UI", "UI", "UI", "UI",
+        "Backend", "Backend", "Backend", "Backend", "Backend", "Backend",
+        "Database", "Database", "Database", "Database", "Database", "Database",
+        "Authentication", "Authentication", "Authentication", "Authentication", "Authentication", "Authentication",
+        "Performance", "Performance", "Performance", "Performance", "Performance", "Performance",
+        "Security", "Security", "Security", "Security", "Security", "Security",
+        "API", "API", "API", "API", "API", "API",
+        "Other", "Other", "Other"
+    ]
+    
+    try:
+        X = vectorizer.transform(training_texts)
+        tag_classifier = LogisticRegression(max_iter=1000, random_state=42, multi_class='multinomial')
+        tag_classifier.fit(X, training_labels)
+        print("✅ Tag classifier trained")
+    except Exception as e:
+        print(f"⚠️ Tag classifier training failed: {e}")
+        tag_classifier = None
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "service": "bug-tracker-ai"}
+    return {
+        "status": "healthy",
+        "models_loaded": {
+            "embedding": embedding_model is not None,
+            "severity": severity_classifier is not None,
+            "tags": tag_classifier is not None
+        },
+        "cpu_optimized": True
+    }
 
-@app.post("/analyze")
+@app.post("/analyze", response_model=dict)
 async def analyze_bug(req: BugRequest):
-    """Single task analysis endpoint"""
+    """
+    Single task analysis - fast CPU-friendly predictions
+    Tasks: predict_severity, predict_priority, categorize, summarize
+    """
+    if not req.text or len(req.text.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Bug description too short")
+    
     try:
-        # ----- Prompt selection -----
-        if req.task == "summarize":
-            prompt = f"Summarize this software bug in one sentence:\n{req.text}"
+        if req.task == "predict_severity":
+            result = predict_severity(req.text)
+            return {"result": result}
+        
         elif req.task == "predict_priority":
-            prompt = f"Classify the priority of this bug as Critical, High, Medium, or Low:\n{req.text}"
-        elif req.task == "predict_severity":
-            prompt = f"Classify the severity of this bug as Critical, Major, Normal, Minor, or Enhancement:\n{req.text}"
+            # Priority is similar to severity but slightly different logic
+            severity = predict_severity(req.text)
+            # Map severity to priority
+            priority_map = {
+                "Critical": "High",
+                "High": "High",
+                "Medium": "Medium",
+                "Low": "Low"
+            }
+            result = priority_map.get(severity, "Medium")
+            return {"result": result}
+        
         elif req.task == "categorize":
-            prompt = f"classify category of bug:\n{req.text}"
+            tags = predict_tags(req.text)
+            result = tags[0] if tags else "Other"
+            return {"result": result}
+        
+        elif req.task == "summarize":
+            # Simple summarization - take first sentence or first 100 chars
+            sentences = req.text.split('.')
+            summary = sentences[0].strip() if sentences else req.text[:100]
+            if len(summary) < 10:
+                summary = req.text[:100] + "..."
+            return {"result": summary}
+        
         else:
-            prompt = req.text
-
-        # ----- Tokenize + Generate -----
-        with torch.no_grad():
-            inputs = t5_tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=256
-            )
-
-            outputs = t5_model.generate(
-                **inputs,
-                max_new_tokens=40,
-                num_beams=4,
-                do_sample=False,
-                early_stopping=True
-            )
-
-        result = t5_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
-
-        # ----- Fallback for bad outputs -----
-        if not result or result in [".", ","]:
-            result = req.text[:100]
-
-        # ----- Normalize outputs -----
-        if req.task == "predict_priority":
-            text = result.lower()
-            if "critical" in text:
-                result = "CRITICAL"
-            elif "high" in text:
-                result = "HIGH"
-            elif "low" in text:
-                result = "LOW"
-            else:
-                result = "MEDIUM"
-
-        elif req.task == "predict_severity":
-            text = result.lower()
-            if "critical" in text:
-                result = "CRITICAL"
-            elif "major" in text:
-                result = "MAJOR"
-            elif "minor" in text:
-                result = "MINOR"
-            elif "enhancement" in text:
-                result = "ENHANCEMENT"
-            else:
-                result = "NORMAL"
-
-        elif req.task == "categorize":
-            categories = ["Authentication", "UI", "Database", "Performance", "Security", "API", "Integration"]
-            result = min(categories, key=lambda x: abs(len(x) - len(result)))
-
-        return {"result": result}
-
+            raise HTTPException(status_code=400, detail=f"Unknown task: {req.task}")
+    
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-@app.post("/analyze/comprehensive")
-async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
-    """Comprehensive AI analysis endpoint - returns all analyses at once"""
+def predict_severity(text: str) -> str:
+    """Predict bug severity using TF-IDF + Logistic Regression"""
+    if severity_classifier is None:
+        # Fallback to rule-based
+        return rule_based_severity(text)
+    
     try:
-        text = req.text
-        
-        # Run all analyses in parallel where possible
-        with torch.no_grad():
-            # Priority prediction
-            priority_prompt = f"Classify the priority of this bug as Critical, High, Medium, or Low:\n{text}"
-            priority_inputs = t5_tokenizer(priority_prompt, return_tensors="pt", truncation=True, max_length=256)
-            priority_outputs = t5_model.generate(**priority_inputs, max_new_tokens=20, num_beams=2, early_stopping=True)
-            priority_result = t5_tokenizer.decode(priority_outputs[0], skip_special_tokens=True).strip().lower()
-            
-            # Severity prediction
-            severity_prompt = f"Classify the severity of this bug as Critical, Major, Normal, Minor, or Enhancement:\n{text}"
-            severity_inputs = t5_tokenizer(severity_prompt, return_tensors="pt", truncation=True, max_length=256)
-            severity_outputs = t5_model.generate(**severity_inputs, max_new_tokens=20, num_beams=2, early_stopping=True)
-            severity_result = t5_tokenizer.decode(severity_outputs[0], skip_special_tokens=True).strip().lower()
-            
-            # Summarization
-            summary_prompt = f"Summarize this software bug in one sentence:\n{text}"
-            summary_inputs = t5_tokenizer(summary_prompt, return_tensors="pt", truncation=True, max_length=256)
-            summary_outputs = t5_model.generate(**summary_inputs, max_new_tokens=50, num_beams=3, early_stopping=True)
-            summary_result = t5_tokenizer.decode(summary_outputs[0], skip_special_tokens=True).strip()
-            
-            # Generate embedding
-            embedding = generate_embedding(text)
-        
-        # Normalize priority
-        if "critical" in priority_result:
-            priority = "CRITICAL"
-        elif "high" in priority_result:
-            priority = "HIGH"
-        elif "low" in priority_result:
-            priority = "LOW"
-        else:
-            priority = "MEDIUM"
-        
-        # Normalize severity
-        if "critical" in severity_result:
-            severity = "CRITICAL"
-        elif "major" in severity_result:
-            severity = "MAJOR"
-        elif "minor" in severity_result:
-            severity = "MINOR"
-        elif "enhancement" in severity_result:
-            severity = "ENHANCEMENT"
-        else:
-            severity = "NORMAL"
-        
-        # Extract entities
-        entities = extract_entities(text)
-        
-        # Generate solution suggestions
-        suggestions = generate_solution_suggestions(text)
-        
-        return {
-            "priority": priority,
-            "severity": severity,
-            "summary": summary_result if summary_result else text[:100],
-            "embedding": embedding,
-            "entities": entities,
-            "suggestions": suggestions
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        X = vectorizer.transform([text.lower()])
+        prediction = severity_classifier.predict(X)[0]
+        return prediction
+    except:
+        return rule_based_severity(text)
 
-@app.post("/embedding")
-async def get_embedding(req: EmbeddingRequest):
-    """Generate embedding vector for similarity search"""
-    try:
-        embedding = generate_embedding(req.text)
-        return {"embedding": embedding}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-def generate_solution_suggestions(text: str) -> List[str]:
-    """Generate solution suggestions based on bug description"""
-    suggestions = []
+def rule_based_severity(text: str) -> str:
+    """Rule-based fallback for severity prediction"""
     text_lower = text.lower()
     
-    # Pattern-based suggestions
-    if "null pointer" in text_lower or "npe" in text_lower:
-        suggestions.append("Check for null references before accessing object properties or methods.")
-        suggestions.append("Add null checks in the code where the error occurs.")
-        suggestions.append("Review the stack trace to identify the exact line causing the NullPointerException.")
+    critical_keywords = ["crash", "data loss", "security breach", "corruption", "system down", "complete failure"]
+    high_keywords = ["not working", "error", "failed", "broken", "critical", "urgent"]
+    low_keywords = ["suggestion", "enhancement", "improvement", "cosmetic", "typo", "minor"]
     
-    if "timeout" in text_lower or "timed out" in text_lower:
-        suggestions.append("Increase the timeout threshold in the configuration.")
-        suggestions.append("Optimize the database queries that might be causing the delay.")
-        suggestions.append("Check network connectivity and server response times.")
+    if any(kw in text_lower for kw in critical_keywords):
+        return "Critical"
+    elif any(kw in text_lower for kw in high_keywords):
+        return "High"
+    elif any(kw in text_lower for kw in low_keywords):
+        return "Low"
+    else:
+        return "Medium"
+
+def predict_tags(text: str, top_n: int = 3) -> List[str]:
+    """Predict bug tags/categories"""
+    if tag_classifier is None:
+        return rule_based_tags(text)
     
-    if "authentication" in text_lower or "login" in text_lower or "unauthorized" in text_lower:
-        suggestions.append("Verify user credentials and authentication tokens.")
-        suggestions.append("Check if the user has proper permissions for the requested resource.")
-        suggestions.append("Review authentication middleware and session management.")
+    try:
+        X = vectorizer.transform([text.lower()])
+        probabilities = tag_classifier.predict_proba(X)[0]
+        top_indices = np.argsort(probabilities)[-top_n:][::-1]
+        tags = [TAG_CATEGORIES[i] for i in top_indices if probabilities[i] > 0.1]
+        return tags if tags else ["Other"]
+    except:
+        return rule_based_tags(text)
+
+def rule_based_tags(text: str) -> List[str]:
+    """Rule-based fallback for tag prediction"""
+    text_lower = text.lower()
+    tags = []
     
-    if "database" in text_lower or "sql" in text_lower:
-        suggestions.append("Check database connection and query syntax.")
-        suggestions.append("Verify database schema matches the expected structure.")
-        suggestions.append("Review database logs for detailed error information.")
+    if any(kw in text_lower for kw in ["ui", "button", "layout", "design", "frontend", "css", "html"]):
+        tags.append("UI")
+    if any(kw in text_lower for kw in ["backend", "server", "api", "endpoint", "service"]):
+        tags.append("Backend")
+    if any(kw in text_lower for kw in ["database", "sql", "query", "db", "data"]):
+        tags.append("Database")
+    if any(kw in text_lower for kw in ["login", "auth", "password", "session", "credential"]):
+        tags.append("Authentication")
+    if any(kw in text_lower for kw in ["slow", "performance", "timeout", "optimize"]):
+        tags.append("Performance")
+    if any(kw in text_lower for kw in ["security", "vulnerability", "breach", "xss", "sql injection"]):
+        tags.append("Security")
     
-    if "memory" in text_lower or "out of memory" in text_lower:
-        suggestions.append("Check for memory leaks in the application.")
-        suggestions.append("Increase JVM heap size if applicable.")
-        suggestions.append("Review object creation and garbage collection patterns.")
+    return tags[:3] if tags else ["Other"]
+
+@app.post("/analyze/comprehensive", response_model=ComprehensiveAnalysisResponse)
+async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
+    """
+    Comprehensive analysis: severity, priority, tags, summary, embedding
+    All in one call - optimized for speed
+    """
+    if not req.text or len(req.text.strip()) < 3:
+        raise HTTPException(status_code=400, detail="Bug description too short")
     
-    # Default suggestions if no specific ones match
-    if not suggestions:
-        suggestions.append("Check the application logs for more detailed error information.")
-        suggestions.append("Verify that all required dependencies are properly installed and configured.")
-        suggestions.append("Review recent code changes that might have introduced this issue.")
-        suggestions.append("Test the functionality in a different environment to isolate the problem.")
+    try:
+        # Parallel predictions (all CPU-friendly)
+        severity = predict_severity(req.text)
+        
+        # Priority based on severity
+        priority_map = {"Critical": "High", "High": "High", "Medium": "Medium", "Low": "Low"}
+        priority = priority_map.get(severity, "Medium")
+        
+        # Tags
+        tags = predict_tags(req.text, top_n=3)
+        
+        # Summary (simple)
+        sentences = req.text.split('.')
+        summary = sentences[0].strip() if sentences else req.text[:150]
+        if len(summary) < 10:
+            summary = req.text[:150] + "..."
+        
+        # Embedding (for duplicate detection)
+        embedding = []
+        if embedding_model:
+            try:
+                emb = embedding_model.encode(req.text, convert_to_numpy=True)
+                embedding = emb.tolist()
+            except:
+                embedding = []
+        
+        return ComprehensiveAnalysisResponse(
+            severity=severity,
+            priority=priority,
+            tags=tags,
+            summary=summary,
+            embedding=embedding
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Comprehensive analysis failed: {str(e)}")
+
+@app.post("/embedding", response_model=EmbeddingResponse)
+async def generate_embedding(req: ComprehensiveAnalysisRequest):
+    """
+    Generate embedding vector for duplicate bug detection
+    Uses sentence-transformers (CPU-friendly)
+    """
+    if not embedding_model:
+        raise HTTPException(status_code=503, detail="Embedding model not loaded")
     
-    return suggestions[:5]  # Return top 5 suggestions
+    try:
+        embedding = embedding_model.encode(req.text, convert_to_numpy=True)
+        return EmbeddingResponse(embedding=embedding.tolist())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
+
+@app.post("/similar", response_model=SimilarBugsResponse)
+async def find_similar_bugs(req: SimilarBugRequest):
+    """
+    Find similar bugs using cosine similarity
+    Note: This endpoint expects bug_ids and embeddings from backend
+    For now, returns structure - backend should handle similarity search
+    """
+    # This is a placeholder - actual similarity search should be done in backend
+    # with bug embeddings stored in database
+    return SimilarBugsResponse(similar_bugs=[])
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
