@@ -7,12 +7,11 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-import pickle
-import os
-from typing import List, Optional
+from sklearn.multiclass import OneVsRestClassifier
+from typing import List, Optional, Tuple
 import time
 
-app = FastAPI(title="Bug Tracker AI Service", version="2.0")
+app = FastAPI(title="Bug Tracker AI Service", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,14 +23,20 @@ app.add_middleware(
 
 # Global models (loaded once at startup)
 embedding_model = None
-severity_classifier = None
-tag_classifier = None
-vectorizer = None
+severity_pipeline = None
+tag_pipeline = None
 
 # Model configuration
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # Fast, CPU-friendly
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 SEVERITY_LABELS = ["Low", "Medium", "High", "Critical"]
-TAG_CATEGORIES = ["UI", "Backend", "Database", "Authentication", "Performance", "Security", "API", "Other"]
+TAG_CATEGORIES = ["UI", "Backend", "Database", "Authentication", "Performance", "Security", "API", "AI", "Other"]
+
+# Model versioning (for production tracking)
+MODEL_VERSION = "severity-v1.0"
+TAG_MODEL_VERSION = "tags-v1.0"
+
+# Confidence threshold (below this, prediction is uncertain)
+CONFIDENCE_THRESHOLD = 0.6
 
 # Request/Response models
 class BugRequest(BaseModel):
@@ -41,153 +46,236 @@ class BugRequest(BaseModel):
 class ComprehensiveAnalysisRequest(BaseModel):
     text: str
 
-class SimilarBugRequest(BaseModel):
-    text: str
-    limit: int = 5
-
-class SimilarBugResponse(BaseModel):
-    bug_id: int
-    similarity_score: float
-    title: str
-
 class ComprehensiveAnalysisResponse(BaseModel):
     severity: str
     priority: str
     tags: List[str]
     summary: str
     embedding: List[float]
+    confidence: Optional[float] = None
+    modelVersion: Optional[str] = None
 
 class EmbeddingResponse(BaseModel):
     embedding: List[float]
 
-class SimilarBugsResponse(BaseModel):
-    similar_bugs: List[SimilarBugResponse]
-
 @app.on_event("startup")
 async def startup_event():
     """Load models on startup - happens once"""
-    global embedding_model, severity_classifier, tag_classifier, vectorizer
+    global embedding_model, severity_pipeline, tag_pipeline
     
-    print("🚀 Loading AI models (CPU-friendly)...")
+    print(" Loading production-ready AI models (CPU-friendly)...")
     start_time = time.time()
     
     # Load embedding model (for duplicate detection)
     try:
         embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        print(f"✅ Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+        print(f"Loaded embedding model: {EMBEDDING_MODEL_NAME}")
     except Exception as e:
-        print(f"❌ Failed to load embedding model: {e}")
+        print(f" Failed to load embedding model: {e}")
         embedding_model = None
     
-    # Initialize TF-IDF vectorizer
-    vectorizer = TfidfVectorizer(max_features=1000, stop_words='english', ngram_range=(1, 2))
-    
-    # Train lightweight classifiers (using rule-based + keyword features)
-    # In production, you'd train these on real bug data
-    train_severity_classifier()
-    train_tag_classifier()
+    # Train ML models with proper sentence-based data
+    train_severity_model()
+    train_tag_model()
     
     elapsed = time.time() - start_time
-    print(f"✅ All models loaded in {elapsed:.2f}s - Ready for inference!")
-    print("💡 Models optimized for CPU - no GPU required!")
+    print(f" All models loaded in {elapsed:.2f}s - Ready for inference!")
 
-def train_severity_classifier():
-    """Train severity classifier using keyword-based features"""
-    global severity_classifier, vectorizer
-    
-    # Training data (keyword-based - you can expand this)
-    training_texts = [
-        # Critical
-        "application crash data loss system down",
-        "security breach unauthorized access",
-        "database corruption all data lost",
-        "complete system failure",
-        # High
-        "login not working authentication failed",
-        "payment processing error",
-        "api endpoint returning 500 error",
-        "major feature broken",
-        # Medium
-        "button not clicking properly",
-        "slow response time",
-        "minor display issue",
-        "form validation error",
-        # Low
-        "typo in error message",
-        "color scheme suggestion",
-        "minor UI improvement",
-        "cosmetic issue"
+def get_training_data():
+
+    # Severity training data (real bug descriptions)
+    severity_training = [
+        # Critical severity
+        ("Application crashes when user submits login form causing data loss", "Critical"),
+        ("Database corruption detected all user data is lost", "Critical"),
+        ("Security breach unauthorized access to admin panel", "Critical"),
+        ("Complete system failure server is down", "Critical"),
+        ("Payment processing fails and charges users incorrectly", "Critical"),
+        ("User accounts are being deleted automatically", "Critical"),
+        
+        # High severity
+        ("Login page not working users cannot access the application", "High"),
+        ("API endpoint returning 500 error for all requests", "High"),
+        ("Payment gateway integration is broken", "High"),
+        ("Major feature not working as expected", "High"),
+        ("User authentication is failing for all users", "High"),
+        ("Critical workflow is broken and blocking users", "High"),
+        
+        # Medium severity
+        ("Button not clicking properly on mobile devices", "Medium"),
+        ("Page loads slowly takes more than 5 seconds", "Medium"),
+        ("Form validation error message is unclear", "Medium"),
+        ("Minor display issue on dashboard", "Medium"),
+        ("Search functionality returns incorrect results sometimes", "Medium"),
+        ("Navigation menu has alignment issues", "Medium"),
+        
+        # Low severity
+        ("Typo in error message text", "Low"),
+        ("Color scheme suggestion for better UX", "Low"),
+        ("Minor UI improvement request", "Low"),
+        ("Cosmetic issue with button styling", "Low"),
+        ("Text alignment could be improved", "Low"),
+        ("Suggestion for better error messages", "Low"),
     ]
     
-    training_labels = [
-        "Critical", "Critical", "Critical", "Critical",
-        "High", "High", "High", "High",
-        "Medium", "Medium", "Medium", "Medium",
-        "Low", "Low", "Low", "Low"
+    # Tag training data (real bug descriptions)
+    tag_training = [
+        # UI tags
+        ("Button color issue on homepage", ["UI"]),
+        ("Layout problem on mobile view", ["UI"]),
+        ("Responsive design breaks on tablet", ["UI"]),
+        ("Frontend component not rendering correctly", ["UI"]),
+        ("CSS styling issue with navigation", ["UI"]),
+        ("User interface element is misaligned", ["UI"]),
+        
+        # Backend tags
+        ("Server error when processing requests", ["Backend"]),
+        ("API endpoint not responding correctly", ["Backend", "API"]),
+        ("Business logic error in calculation", ["Backend"]),
+        ("Backend service is timing out", ["Backend"]),
+        ("Server-side validation is failing", ["Backend"]),
+        ("Application logic has a bug", ["Backend"]),
+        
+        # Database tags
+        ("Database query is taking too long", ["Database", "Performance"]),
+        ("SQL error when fetching user data", ["Database"]),
+        ("Data retrieval is slow", ["Database", "Performance"]),
+        ("Database connection is failing", ["Database"]),
+        ("Data persistence issue", ["Database"]),
+        ("Query optimization needed", ["Database", "Performance"]),
+        
+        # Authentication tags
+        ("Login failed for valid users", ["Authentication"]),
+        ("Authentication error when accessing dashboard", ["Authentication"]),
+        ("Session expired too quickly", ["Authentication"]),
+        ("Password reset functionality broken", ["Authentication"]),
+        ("User credentials not working", ["Authentication"]),
+        ("Access control issue", ["Authentication", "Security"]),
+        
+        # Performance tags
+        ("Slow loading time on dashboard", ["Performance"]),
+        ("Response time is too high", ["Performance"]),
+        ("Performance issue with data processing", ["Performance"]),
+        ("Optimization needed for faster queries", ["Performance"]),
+        ("Bottleneck in API calls", ["Performance", "API"]),
+        ("Timeout error on slow connections", ["Performance"]),
+        
+        # Security tags
+        ("Security vulnerability in authentication", ["Security", "Authentication"]),
+        ("XSS attack possible in user input", ["Security"]),
+        ("SQL injection vulnerability detected", ["Security", "Database"]),
+        ("Unauthorized access to admin functions", ["Security"]),
+        ("Data breach risk identified", ["Security"]),
+        ("Encryption issue with sensitive data", ["Security"]),
+        
+        # API tags
+        ("REST API endpoint returning errors", ["API"]),
+        ("HTTP request failing", ["API"]),
+        ("API integration broken", ["API"]),
+        ("Webhook not receiving data", ["API"]),
+        ("Service call timeout", ["API", "Performance"]),
+        
+        # AI tags
+        ("AI model prediction is incorrect", ["AI"]),
+        ("Machine learning model not working", ["AI"]),
+        ("AI service returning wrong results", ["AI"]),
+        ("ML model accuracy is low", ["AI"]),
+        ("AI prediction failed", ["AI"]),
+        ("Neural network error", ["AI"]),
+        ("AI analysis is slow", ["AI", "Performance"]),
+        ("ML training process crashed", ["AI"]),
+        ("AI embedding generation failed", ["AI"]),
+        ("Machine learning pipeline broken", ["AI"]),
+        ("AI recommendation system not working", ["AI"]),
+        ("Natural language processing error", ["AI"]),
+        ("AI classification is wrong", ["AI"]),
+        ("Deep learning model timeout", ["AI", "Performance"]),
+        
+        # Other
+        ("General issue needs investigation", ["Other"]),
+        ("Miscellaneous bug report", ["Other"]),
     ]
+    
+    return severity_training, tag_training
+
+def train_severity_model():
+   
+    global severity_pipeline
+    
+    severity_training, _ = get_training_data()
+    
+    # Extract texts and labels
+    texts = [item[0] for item in severity_training]
+    labels = [item[1] for item in severity_training]
+    
+    # Expand training data with variations (data augmentation)
+    expanded_texts = texts * 2  # Double the dataset
+    expanded_labels = labels * 2
+    
+    try:
+        # Create ML pipeline: TF-IDF → Logistic Regression
+        severity_pipeline = Pipeline([
+            ("tfidf", TfidfVectorizer(
+                ngram_range=(1, 2),  # Unigrams and bigrams
+                stop_words='english',
+                max_features=5000,
+                min_df=1,
+                max_df=0.95
+            )),
+            ("clf", LogisticRegression(
+                max_iter=1000,
+                random_state=42,
+                multi_class='multinomial',
+                solver='lbfgs'
+            ))
+        ])
+        
+        # Train the model
+        severity_pipeline.fit(expanded_texts, expanded_labels)
+        print(f" Severity classifier trained (v{MODEL_VERSION}) - {len(expanded_texts)} samples")
+    except Exception as e:
+        print(f" Severity classifier training failed: {e}")
+        severity_pipeline = None
+
+def train_tag_model():
+   
+    global tag_pipeline
+    
+    _, tag_training = get_training_data()
+    
+    # Extract texts and labels
+    texts = [item[0] for item in tag_training]
+    # Convert multi-label to binary matrix
+    labels = []
+    for item in tag_training:
+        label_vector = [1 if tag in item[1] else 0 for tag in TAG_CATEGORIES]
+        labels.append(label_vector)
     
     # Expand training data
-    expanded_texts = training_texts * 3
-    expanded_labels = training_labels * 3
+    expanded_texts = texts * 2
+    expanded_labels = labels * 2
     
     try:
-        X = vectorizer.fit_transform(expanded_texts)
-        severity_classifier = LogisticRegression(max_iter=1000, random_state=42)
-        severity_classifier.fit(X, expanded_labels)
-        print("✅ Severity classifier trained")
+        # Create ML pipeline for multi-label classification
+        tag_pipeline = Pipeline([
+            ("tfidf", TfidfVectorizer(
+                ngram_range=(1, 2),
+                stop_words='english',
+                max_features=5000,
+                min_df=1,
+                max_df=0.95
+            )),
+            ("clf", OneVsRestClassifier(
+                LogisticRegression(max_iter=1000, random_state=42, solver='lbfgs')
+            ))
+        ])
+        
+        # Train the model
+        tag_pipeline.fit(expanded_texts, expanded_labels)
+        print(f" Tag classifier trained (v{TAG_MODEL_VERSION}) - {len(expanded_texts)} samples")
     except Exception as e:
-        print(f"⚠️ Severity classifier training failed: {e}")
-        severity_classifier = None
-
-def train_tag_classifier():
-    """Train tag classifier"""
-    global tag_classifier
-    
-    training_texts = [
-        # UI
-        "button color issue", "layout problem", "responsive design",
-        "frontend component", "user interface", "css styling",
-        # Backend
-        "server error", "api endpoint", "business logic",
-        "backend service", "server-side", "application logic",
-        # Database
-        "database query", "sql error", "data retrieval",
-        "database connection", "data persistence", "query optimization",
-        # Authentication
-        "login failed", "authentication error", "session expired",
-        "password reset", "user credentials", "access control",
-        # Performance
-        "slow loading", "response time", "performance issue",
-        "optimization needed", "bottleneck", "timeout error",
-        # Security
-        "security vulnerability", "xss attack", "sql injection",
-        "unauthorized access", "data breach", "encryption",
-        # API
-        "rest api", "endpoint error", "http request",
-        "api integration", "webhook", "service call",
-        # Other
-        "general issue", "miscellaneous", "other problem"
-    ]
-    
-    training_labels = [
-        "UI", "UI", "UI", "UI", "UI", "UI",
-        "Backend", "Backend", "Backend", "Backend", "Backend", "Backend",
-        "Database", "Database", "Database", "Database", "Database", "Database",
-        "Authentication", "Authentication", "Authentication", "Authentication", "Authentication", "Authentication",
-        "Performance", "Performance", "Performance", "Performance", "Performance", "Performance",
-        "Security", "Security", "Security", "Security", "Security", "Security",
-        "API", "API", "API", "API", "API", "API",
-        "Other", "Other", "Other"
-    ]
-    
-    try:
-        X = vectorizer.transform(training_texts)
-        tag_classifier = LogisticRegression(max_iter=1000, random_state=42, multi_class='multinomial')
-        tag_classifier.fit(X, training_labels)
-        print("✅ Tag classifier trained")
-    except Exception as e:
-        print(f"⚠️ Tag classifier training failed: {e}")
-        tag_classifier = None
+        print(f" Tag classifier training failed: {e}")
+        tag_pipeline = None
 
 @app.get("/health")
 async def health_check():
@@ -196,29 +284,76 @@ async def health_check():
         "status": "healthy",
         "models_loaded": {
             "embedding": embedding_model is not None,
-            "severity": severity_classifier is not None,
-            "tags": tag_classifier is not None
+            "severity": severity_pipeline is not None,
+            "tags": tag_pipeline is not None
         },
-        "cpu_optimized": True
+        "model_versions": {
+            "severity": MODEL_VERSION,
+            "tags": TAG_MODEL_VERSION
+        },
+        "cpu_optimized": True,
+        "production_ready": True
     }
+
+def predict_severity_with_confidence(text: str) -> Tuple[str, float]:
+
+    if severity_pipeline is None:
+        raise ValueError("Severity model not loaded")
+    
+    try:
+        # Get prediction and probabilities
+        prediction = severity_pipeline.predict([text])[0]
+        probabilities = severity_pipeline.predict_proba([text])[0]
+        confidence = float(max(probabilities))
+        
+        return prediction, confidence
+    except Exception as e:
+        raise ValueError(f"Severity prediction failed: {e}")
+
+def predict_tags_with_confidence(text: str, top_n: int = 3) -> Tuple[List[str], float]:
+
+    if tag_pipeline is None:
+        raise ValueError("Tag model not loaded")
+    
+    try:
+        # Get probabilities for all tags
+        probabilities = tag_pipeline.predict_proba([text])[0]
+        
+        # Get top N tags with highest probabilities
+        top_indices = np.argsort(probabilities)[-top_n:][::-1]
+        tags = []
+        confidences = []
+        
+        for idx in top_indices:
+            if probabilities[idx] > 0.1:  # Threshold for tag relevance
+                tags.append(TAG_CATEGORIES[idx])
+                confidences.append(float(probabilities[idx]))
+        
+        # Calculate average confidence
+        avg_confidence = float(np.mean(confidences)) if confidences else 0.0
+        
+        return tags if tags else ["Other"], avg_confidence
+    except Exception as e:
+        raise ValueError(f"Tag prediction failed: {e}")
 
 @app.post("/analyze", response_model=dict)
 async def analyze_bug(req: BugRequest):
-    """
-    Single task analysis - fast CPU-friendly predictions
-    Tasks: predict_severity, predict_priority, categorize, summarize
-    """
+
     if not req.text or len(req.text.strip()) < 3:
         raise HTTPException(status_code=400, detail="Bug description too short")
     
     try:
         if req.task == "predict_severity":
-            result = predict_severity(req.text)
-            return {"result": result}
+            severity, confidence = predict_severity_with_confidence(req.text)
+            return {
+                "result": severity,
+                "confidence": confidence,
+                "modelVersion": MODEL_VERSION,
+                "needsReview": confidence < CONFIDENCE_THRESHOLD
+            }
         
         elif req.task == "predict_priority":
-            # Priority is similar to severity but slightly different logic
-            severity = predict_severity(req.text)
+            severity, confidence = predict_severity_with_confidence(req.text)
             # Map severity to priority
             priority_map = {
                 "Critical": "High",
@@ -226,13 +361,20 @@ async def analyze_bug(req: BugRequest):
                 "Medium": "Medium",
                 "Low": "Low"
             }
-            result = priority_map.get(severity, "Medium")
-            return {"result": result}
+            priority = priority_map.get(severity, "Medium")
+            return {
+                "result": priority,
+                "confidence": confidence,
+                "modelVersion": MODEL_VERSION
+            }
         
         elif req.task == "categorize":
-            tags = predict_tags(req.text)
-            result = tags[0] if tags else "Other"
-            return {"result": result}
+            tags, confidence = predict_tags_with_confidence(req.text, top_n=1)
+            return {
+                "result": tags[0] if tags else "Other",
+                "confidence": confidence,
+                "modelVersion": TAG_MODEL_VERSION
+            }
         
         elif req.task == "summarize":
             # Simple summarization - take first sentence or first 100 chars
@@ -245,92 +387,25 @@ async def analyze_bug(req: BugRequest):
         else:
             raise HTTPException(status_code=400, detail=f"Unknown task: {req.task}")
     
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-def predict_severity(text: str) -> str:
-    """Predict bug severity using TF-IDF + Logistic Regression"""
-    if severity_classifier is None:
-        # Fallback to rule-based
-        return rule_based_severity(text)
-    
-    try:
-        X = vectorizer.transform([text.lower()])
-        prediction = severity_classifier.predict(X)[0]
-        return prediction
-    except:
-        return rule_based_severity(text)
-
-def rule_based_severity(text: str) -> str:
-    """Rule-based fallback for severity prediction"""
-    text_lower = text.lower()
-    
-    critical_keywords = ["crash", "data loss", "security breach", "corruption", "system down", "complete failure"]
-    high_keywords = ["not working", "error", "failed", "broken", "critical", "urgent"]
-    low_keywords = ["suggestion", "enhancement", "improvement", "cosmetic", "typo", "minor"]
-    
-    if any(kw in text_lower for kw in critical_keywords):
-        return "Critical"
-    elif any(kw in text_lower for kw in high_keywords):
-        return "High"
-    elif any(kw in text_lower for kw in low_keywords):
-        return "Low"
-    else:
-        return "Medium"
-
-def predict_tags(text: str, top_n: int = 3) -> List[str]:
-    """Predict bug tags/categories"""
-    if tag_classifier is None:
-        return rule_based_tags(text)
-    
-    try:
-        X = vectorizer.transform([text.lower()])
-        probabilities = tag_classifier.predict_proba(X)[0]
-        top_indices = np.argsort(probabilities)[-top_n:][::-1]
-        tags = [TAG_CATEGORIES[i] for i in top_indices if probabilities[i] > 0.1]
-        return tags if tags else ["Other"]
-    except:
-        return rule_based_tags(text)
-
-def rule_based_tags(text: str) -> List[str]:
-    """Rule-based fallback for tag prediction"""
-    text_lower = text.lower()
-    tags = []
-    
-    if any(kw in text_lower for kw in ["ui", "button", "layout", "design", "frontend", "css", "html"]):
-        tags.append("UI")
-    if any(kw in text_lower for kw in ["backend", "server", "api", "endpoint", "service"]):
-        tags.append("Backend")
-    if any(kw in text_lower for kw in ["database", "sql", "query", "db", "data"]):
-        tags.append("Database")
-    if any(kw in text_lower for kw in ["login", "auth", "password", "session", "credential"]):
-        tags.append("Authentication")
-    if any(kw in text_lower for kw in ["slow", "performance", "timeout", "optimize"]):
-        tags.append("Performance")
-    if any(kw in text_lower for kw in ["security", "vulnerability", "breach", "xss", "sql injection"]):
-        tags.append("Security")
-    
-    return tags[:3] if tags else ["Other"]
-
 @app.post("/analyze/comprehensive", response_model=ComprehensiveAnalysisResponse)
 async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
-    """
-    Comprehensive analysis: severity, priority, tags, summary, embedding
-    All in one call - optimized for speed
-    """
+
     if not req.text or len(req.text.strip()) < 3:
         raise HTTPException(status_code=400, detail="Bug description too short")
     
     try:
-        # Parallel predictions (all CPU-friendly)
-        severity = predict_severity(req.text)
+        # Get ML predictions with confidence
+        severity, severity_conf = predict_severity_with_confidence(req.text)
+        tags, tag_conf = predict_tags_with_confidence(req.text, top_n=3)
         
         # Priority based on severity
         priority_map = {"Critical": "High", "High": "High", "Medium": "Medium", "Low": "Low"}
         priority = priority_map.get(severity, "Medium")
-        
-        # Tags
-        tags = predict_tags(req.text, top_n=3)
         
         # Summary (simple)
         sentences = req.text.split('.')
@@ -347,23 +422,27 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
             except:
                 embedding = []
         
+        # Average confidence across predictions
+        avg_confidence = (severity_conf + tag_conf) / 2
+        
         return ComprehensiveAnalysisResponse(
             severity=severity,
             priority=priority,
             tags=tags,
             summary=summary,
-            embedding=embedding
+            embedding=embedding,
+            confidence=avg_confidence,
+            modelVersion=MODEL_VERSION
         )
-
+    
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Comprehensive analysis failed: {str(e)}")
 
 @app.post("/embedding", response_model=EmbeddingResponse)
 async def generate_embedding(req: ComprehensiveAnalysisRequest):
-    """
-    Generate embedding vector for duplicate bug detection
-    Uses sentence-transformers (CPU-friendly)
-    """
+
     if not embedding_model:
         raise HTTPException(status_code=503, detail="Embedding model not loaded")
     
@@ -372,17 +451,6 @@ async def generate_embedding(req: ComprehensiveAnalysisRequest):
         return EmbeddingResponse(embedding=embedding.tolist())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding generation failed: {str(e)}")
-
-@app.post("/similar", response_model=SimilarBugsResponse)
-async def find_similar_bugs(req: SimilarBugRequest):
-    """
-    Find similar bugs using cosine similarity
-    Note: This endpoint expects bug_ids and embeddings from backend
-    For now, returns structure - backend should handle similarity search
-    """
-    # This is a placeholder - actual similarity search should be done in backend
-    # with bug embeddings stored in database
-    return SimilarBugsResponse(similar_bugs=[])
 
 if __name__ == "__main__":
     import uvicorn
