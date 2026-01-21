@@ -3,6 +3,7 @@ services:
   - type: web
     name: bug-tracker-ai
     env: python
+    pythonVersion: "3.11"  # Use Python 3.11 for better compatibility
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn main:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
     envVars:
