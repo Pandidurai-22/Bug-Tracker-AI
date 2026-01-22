@@ -127,6 +127,18 @@ def get_training_data():
         ("Frontend component not rendering correctly", ["UI"]),
         ("CSS styling issue with navigation", ["UI"]),
         ("User interface element is misaligned", ["UI"]),
+        ("Login page ui is not correct", ["UI", "Authentication"]),
+        ("Login page design is broken", ["UI", "Authentication"]),
+        ("Login form layout issue", ["UI", "Authentication"]),
+        ("Login button not visible", ["UI", "Authentication"]),
+        ("Login page styling problem", ["UI", "Authentication"]),
+        ("UI element not displaying properly", ["UI"]),
+        ("Page layout is broken", ["UI"]),
+        ("Frontend page not loading correctly", ["UI"]),
+        ("User interface is not working", ["UI"]),
+        ("Page design issue", ["UI"]),
+        ("Visual bug on page", ["UI"]),
+        ("Styling problem with component", ["UI"]),
         
         # Backend tags
         ("Server error when processing requests", ["Backend"]),
@@ -135,6 +147,14 @@ def get_training_data():
         ("Backend service is timing out", ["Backend"]),
         ("Server-side validation is failing", ["Backend"]),
         ("Application logic has a bug", ["Backend"]),
+        ("Backend api is not calling", ["Backend", "API"]),
+        ("Backend service not responding", ["Backend"]),
+        ("Backend endpoint failing", ["Backend", "API"]),
+        ("Server not processing requests", ["Backend"]),
+        ("Backend logic error", ["Backend"]),
+        ("Backend service down", ["Backend"]),
+        ("Backend code has bug", ["Backend"]),
+        ("Server-side issue", ["Backend"]),
         
         # Database tags
         ("Database query is taking too long", ["Database", "Performance"]),
@@ -151,6 +171,14 @@ def get_training_data():
         ("Password reset functionality broken", ["Authentication"]),
         ("User credentials not working", ["Authentication"]),
         ("Access control issue", ["Authentication", "Security"]),
+        ("Login not working", ["Authentication"]),
+        ("Cannot login to system", ["Authentication"]),
+        ("Login page not working", ["Authentication", "UI"]),
+        ("Authentication system broken", ["Authentication"]),
+        ("User login failing", ["Authentication"]),
+        ("Login credentials invalid", ["Authentication"]),
+        ("Sign in not working", ["Authentication"]),
+        ("Login form submission error", ["Authentication"]),
         
         # Performance tags
         ("Slow loading time on dashboard", ["Performance"]),
@@ -174,6 +202,13 @@ def get_training_data():
         ("API integration broken", ["API"]),
         ("Webhook not receiving data", ["API"]),
         ("Service call timeout", ["API", "Performance"]),
+        ("API call not working", ["API"]),
+        ("API request failing", ["API"]),
+        ("API endpoint error", ["API", "Backend"]),
+        ("API service not responding", ["API", "Backend"]),
+        ("API call timeout", ["API", "Performance"]),
+        ("HTTP request error", ["API"]),
+        ("API integration issue", ["API"]),
         
         # AI tags
         ("AI model prediction is incorrect", ["AI"]),
@@ -319,19 +354,33 @@ def predict_tags_with_confidence(text: str, top_n: int = 3) -> Tuple[List[str], 
         # Get probabilities for all tags
         probabilities = tag_pipeline.predict_proba([text])[0]
         
-        # Get top N tags with highest probabilities
-        top_indices = np.argsort(probabilities)[-top_n:][::-1]
+        # Create list of (tag, probability) pairs
+        tag_probs = [(TAG_CATEGORIES[i], float(probabilities[i])) for i in range(len(TAG_CATEGORIES))]
+        
+        # Sort by probability (descending)
+        tag_probs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Filter tags with probability > 0.15 (increased threshold for better accuracy)
+        # and take top N
         tags = []
         confidences = []
         
-        for idx in top_indices:
-            if probabilities[idx] > 0.1:  # Threshold for tag relevance
-                tags.append(TAG_CATEGORIES[idx])
-                confidences.append(float(probabilities[idx]))
+        for tag, prob in tag_probs:
+            if prob > 0.15 and len(tags) < top_n:  # Higher threshold, limit to top_n
+                # Avoid duplicate or conflicting tags
+                if tag not in tags:
+                    tags.append(tag)
+                    confidences.append(prob)
+        
+        # If no tags meet threshold, use top tag anyway (but with lower confidence)
+        if not tags and len(tag_probs) > 0:
+            tags = [tag_probs[0][0]]
+            confidences = [tag_probs[0][1]]
         
         # Calculate average confidence
         avg_confidence = float(np.mean(confidences)) if confidences else 0.0
         
+        # Ensure at least one tag
         return tags if tags else ["Other"], avg_confidence
     except Exception as e:
         raise ValueError(f"Tag prediction failed: {e}")
