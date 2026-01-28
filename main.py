@@ -22,10 +22,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global models (loaded once at startup)
+# Global models (lazy-loaded on first request)
 embedding_model = None
 severity_pipeline = None
 tag_pipeline = None
+_models_loading = False
+_models_loaded = False
 
 # Model configuration
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -59,35 +61,54 @@ class ComprehensiveAnalysisResponse(BaseModel):
 class EmbeddingResponse(BaseModel):
     embedding: List[float]
 
-@app.on_event("startup")
-async def startup_event():
-    """Load models on startup - happens once"""
-    global embedding_model, severity_pipeline, tag_pipeline
+def ensure_models_loaded():
+    """Lazy-load models on first request - prevents blocking startup"""
+    global embedding_model, severity_pipeline, tag_pipeline, _models_loading, _models_loaded
     
-    print("🚀 Starting AI service...")
-    print("⏳ Loading production-ready AI models (CPU-friendly)...")
-    print("   This may take 2-5 minutes on first startup...")
-    start_time = time.time()
+    # Already loaded
+    if _models_loaded:
+        return
     
-    # Load embedding model (for duplicate detection)
+    # Another request is already loading models, wait for it
+    if _models_loading:
+        # Wait up to 5 minutes for models to load
+        wait_start = time.time()
+        while _models_loading and (time.time() - wait_start) < 300:
+            time.sleep(0.5)
+        if _models_loaded:
+            return
+    
+    # Start loading models
+    _models_loading = True
     try:
-        print("   📦 Loading embedding model...")
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        print(f"   ✅ Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+        print("🚀 Loading AI models (lazy initialization)...")
+        print("⏳ This may take 2-5 minutes on first request...")
+        start_time = time.time()
+        
+        # Load embedding model (for duplicate detection)
+        try:
+            print("   📦 Loading embedding model...")
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+            print(f"   ✅ Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+        except Exception as e:
+            print(f"   ❌ Failed to load embedding model: {e}")
+            embedding_model = None
+        
+        # Train ML models with proper sentence-based data
+        print("   🧠 Training severity classifier...")
+        train_severity_model()
+        
+        print("   🏷️  Training tag classifier...")
+        train_tag_model()
+        
+        elapsed = time.time() - start_time
+        print(f"✅ All models loaded in {elapsed:.2f}s - Ready for inference!")
+        _models_loaded = True
     except Exception as e:
-        print(f"   ❌ Failed to load embedding model: {e}")
-        embedding_model = None
-    
-    # Train ML models with proper sentence-based data
-    print("   🧠 Training severity classifier...")
-    train_severity_model()
-    
-    print("   🏷️  Training tag classifier...")
-    train_tag_model()
-    
-    elapsed = time.time() - start_time
-    print(f"✅ All models loaded in {elapsed:.2f}s - Ready for inference!")
-    print(f"🌐 Service is ready at: http://0.0.0.0:{os.environ.get('PORT', 10000)}")
+        print(f"❌ Error loading models: {e}")
+        raise
+    finally:
+        _models_loading = False
 
 def get_training_data():
 
@@ -401,7 +422,9 @@ def predict_tags_with_confidence(text: str, top_n: int = 3) -> Tuple[List[str], 
 
 @app.post("/analyze", response_model=dict)
 async def analyze_bug(req: BugRequest):
-
+    # Lazy-load models on first request
+    ensure_models_loaded()
+    
     if not req.text or len(req.text.strip()) < 3:
         raise HTTPException(status_code=400, detail="Bug description too short")
     
@@ -457,7 +480,9 @@ async def analyze_bug(req: BugRequest):
 
 @app.post("/analyze/comprehensive", response_model=ComprehensiveAnalysisResponse)
 async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
-
+    # Lazy-load models on first request
+    ensure_models_loaded()
+    
     if not req.text or len(req.text.strip()) < 3:
         raise HTTPException(status_code=400, detail="Bug description too short")
     
@@ -505,7 +530,9 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
 
 @app.post("/embedding", response_model=EmbeddingResponse)
 async def generate_embedding(req: ComprehensiveAnalysisRequest):
-
+    # Lazy-load models on first request
+    ensure_models_loaded()
+    
     if not embedding_model:
         raise HTTPException(status_code=503, detail="Embedding model not loaded")
     

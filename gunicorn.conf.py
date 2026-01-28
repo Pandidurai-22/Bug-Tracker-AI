@@ -17,9 +17,9 @@ print(f"[Gunicorn Config] Binding to: {bind}", file=sys.stderr)
 workers = 1
 worker_class = "uvicorn.workers.UvicornWorker"
 worker_connections = 1000
-timeout = 600  # Increased to 10 minutes for model loading
+timeout = 1200  # 20 minutes - allows for slow model downloads on free tier
 keepalive = 5
-graceful_timeout = 120  # Time to wait for workers to finish
+graceful_timeout = 300  # 5 minutes - time to wait for workers to finish gracefully
 
 # Logging
 accesslog = "-"
