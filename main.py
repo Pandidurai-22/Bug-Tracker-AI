@@ -10,6 +10,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.multiclass import OneVsRestClassifier
 from typing import List, Optional, Tuple
 import time
+import os
 
 app = FastAPI(title="Bug Tracker AI Service", version="2.1")
 
@@ -63,23 +64,30 @@ async def startup_event():
     """Load models on startup - happens once"""
     global embedding_model, severity_pipeline, tag_pipeline
     
-    print(" Loading production-ready AI models (CPU-friendly)...")
+    print("🚀 Starting AI service...")
+    print("⏳ Loading production-ready AI models (CPU-friendly)...")
+    print("   This may take 2-5 minutes on first startup...")
     start_time = time.time()
     
     # Load embedding model (for duplicate detection)
     try:
+        print("   📦 Loading embedding model...")
         embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        print(f"Loaded embedding model: {EMBEDDING_MODEL_NAME}")
+        print(f"   ✅ Loaded embedding model: {EMBEDDING_MODEL_NAME}")
     except Exception as e:
-        print(f" Failed to load embedding model: {e}")
+        print(f"   ❌ Failed to load embedding model: {e}")
         embedding_model = None
     
     # Train ML models with proper sentence-based data
+    print("   🧠 Training severity classifier...")
     train_severity_model()
+    
+    print("   🏷️  Training tag classifier...")
     train_tag_model()
     
     elapsed = time.time() - start_time
-    print(f" All models loaded in {elapsed:.2f}s - Ready for inference!")
+    print(f"✅ All models loaded in {elapsed:.2f}s - Ready for inference!")
+    print(f"🌐 Service is ready at: http://0.0.0.0:{os.environ.get('PORT', 10000)}")
 
 def get_training_data():
 
@@ -278,8 +286,6 @@ def train_tag_model():
     
     _, tag_training = get_training_data()
     
-    print(f"📊 Training tag model with {len(tag_training)} samples...")
-    
     # Extract texts and labels
     texts = [item[0] for item in tag_training]
     # Convert multi-label to binary matrix
@@ -291,8 +297,6 @@ def train_tag_model():
     # Expand training data
     expanded_texts = texts * 2
     expanded_labels = labels * 2
-    
-    print(f"📊 Expanded to {len(expanded_texts)} training samples")
     
     try:
         # Create ML pipeline for multi-label classification
@@ -310,40 +314,34 @@ def train_tag_model():
         ])
         
         # Train the model
-        print("🔄 Fitting tag classifier...")
         tag_pipeline.fit(expanded_texts, expanded_labels)
-        print(f"✅ Tag classifier trained successfully (v{TAG_MODEL_VERSION}) - {len(expanded_texts)} samples")
-        
-        # Test the model with a sample
-        test_text = "login page ui is not working"
-        try:
-            test_tags, test_conf = predict_tags_with_confidence(test_text, top_n=3)
-            print(f"🧪 Test prediction for '{test_text}': {test_tags} (confidence: {test_conf:.2f})")
-        except Exception as test_error:
-            print(f"⚠️ Test prediction failed: {test_error}")
-            
+        print(f" Tag classifier trained (v{TAG_MODEL_VERSION}) - {len(expanded_texts)} samples")
     except Exception as e:
-        print(f"❌ Tag classifier training failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f" Tag classifier training failed: {e}")
         tag_pipeline = None
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint - responds immediately even during model loading"""
+    # Always return healthy status - models can load in background
+    models_loaded = {
+        "embedding": embedding_model is not None,
+        "severity": severity_pipeline is not None,
+        "tags": tag_pipeline is not None
+    }
+    
+    # Determine overall status
+    status = "healthy" if all(models_loaded.values()) else "loading"
+    
     return {
-        "status": "healthy",
-        "models_loaded": {
-            "embedding": embedding_model is not None,
-            "severity": severity_pipeline is not None,
-            "tags": tag_pipeline is not None
-        },
+        "status": status,
+        "models_loaded": models_loaded,
         "model_versions": {
             "severity": MODEL_VERSION,
             "tags": TAG_MODEL_VERSION
         },
         "cpu_optimized": True,
-        "production_ready": True
+        "production_ready": all(models_loaded.values())
     }
 
 def predict_severity_with_confidence(text: str) -> Tuple[str, float]:
@@ -364,24 +362,17 @@ def predict_severity_with_confidence(text: str) -> Tuple[str, float]:
 def predict_tags_with_confidence(text: str, top_n: int = 3) -> Tuple[List[str], float]:
 
     if tag_pipeline is None:
-        print("⚠️ Tag pipeline is None - returning default tag")
-        return ["Other"], 0.5
+        raise ValueError("Tag model not loaded")
     
     try:
         # Get probabilities for all tags
         probabilities = tag_pipeline.predict_proba([text])[0]
-        
-        if probabilities is None or len(probabilities) == 0:
-            print("⚠️ No probabilities returned from tag pipeline")
-            return ["Other"], 0.5
         
         # Create list of (tag, probability) pairs
         tag_probs = [(TAG_CATEGORIES[i], float(probabilities[i])) for i in range(len(TAG_CATEGORIES))]
         
         # Sort by probability (descending)
         tag_probs.sort(key=lambda x: x[1], reverse=True)
-        
-        print(f"🔍 Tag probabilities for '{text[:50]}...': {tag_probs[:3]}")
         
         # Filter tags with probability > 0.15 (increased threshold for better accuracy)
         # and take top N
@@ -399,20 +390,14 @@ def predict_tags_with_confidence(text: str, top_n: int = 3) -> Tuple[List[str], 
         if not tags and len(tag_probs) > 0:
             tags = [tag_probs[0][0]]
             confidences = [tag_probs[0][1]]
-            print(f"⚠️ No tags above threshold, using top tag: {tags[0]} (prob: {confidences[0]:.2f})")
         
         # Calculate average confidence
         avg_confidence = float(np.mean(confidences)) if confidences else 0.0
         
         # Ensure at least one tag
-        final_tags = tags if tags else ["Other"]
-        print(f"✅ Final tags: {final_tags} (confidence: {avg_confidence:.2f})")
-        return final_tags, avg_confidence
+        return tags if tags else ["Other"], avg_confidence
     except Exception as e:
-        print(f"❌ Tag prediction failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return ["Other"], 0.5
+        raise ValueError(f"Tag prediction failed: {e}")
 
 @app.post("/analyze", response_model=dict)
 async def analyze_bug(req: BugRequest):
@@ -477,20 +462,9 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
         raise HTTPException(status_code=400, detail="Bug description too short")
     
     try:
-        print(f"🔍 Analyzing text: {req.text[:100]}...")
-        
         # Get ML predictions with confidence
         severity, severity_conf = predict_severity_with_confidence(req.text)
-        print(f"✅ Severity predicted: {severity} (confidence: {severity_conf:.2f})")
-        
         tags, tag_conf = predict_tags_with_confidence(req.text, top_n=3)
-        print(f"✅ Tags predicted: {tags} (confidence: {tag_conf:.2f})")
-        
-        # Ensure tags is not empty - always return at least one tag
-        if not tags or len(tags) == 0:
-            tags = ["Other"]
-            tag_conf = 0.5
-            print(f"⚠️ No tags predicted, using default: {tags}")
         
         # Priority based on severity
         priority_map = {"Critical": "High", "High": "High", "Medium": "Medium", "Low": "Low"}
@@ -508,14 +482,13 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
             try:
                 emb = embedding_model.encode(req.text, convert_to_numpy=True)
                 embedding = emb.tolist()
-            except Exception as emb_error:
-                print(f"⚠️ Embedding generation failed: {emb_error}")
+            except:
                 embedding = []
         
         # Average confidence across predictions
         avg_confidence = (severity_conf + tag_conf) / 2
         
-        response = ComprehensiveAnalysisResponse(
+        return ComprehensiveAnalysisResponse(
             severity=severity,
             priority=priority,
             tags=tags,
@@ -524,17 +497,10 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
             confidence=avg_confidence,
             modelVersion=MODEL_VERSION
         )
-        
-        print(f"📤 Returning response - Tags: {response.tags}, Severity: {response.severity}, Priority: {response.priority}")
-        return response
     
     except ValueError as e:
-        print(f"❌ ValueError in comprehensive analysis: {e}")
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        print(f"❌ Exception in comprehensive analysis: {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Comprehensive analysis failed: {str(e)}")
 
 @app.post("/embedding", response_model=EmbeddingResponse)
