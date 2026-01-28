@@ -341,6 +341,18 @@ def train_tag_model():
         print(f" Tag classifier training failed: {e}")
         tag_pipeline = None
 
+@app.get("/")
+async def root_health_check():
+    """Fast root endpoint for Render health checks - responds immediately"""
+    global _models_loaded, _models_loading
+    if _models_loaded:
+        return {"status": "healthy", "message": "AI service is fully operational."}
+    elif _models_loading:
+        return {"status": "loading", "message": "AI models are currently loading. Please try again shortly."}
+    else:
+        # Service is up but models not loaded yet - this is fine for health checks
+        return {"status": "ready", "message": "AI service is ready. Models will load on first request."}
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint - responds immediately even during model loading"""
